@@ -256,6 +256,8 @@ eHalStatus wlan_hdd_remain_on_channel_callback( tHalHandle hHal, void* pCtx,
     }
     vos_mem_free( pRemainChanCtx );
     pRemainChanCtx = NULL;
+    if (eHAL_STATUS_SUCCESS != status)
+        complete(&pAdapter->rem_on_chan_ready_event);
     complete(&pAdapter->cancel_rem_on_chan_var);
     pAdapter->is_roc_inprogress = FALSE;
     hdd_allow_suspend();
@@ -806,16 +808,19 @@ int __wlan_hdd_cfg80211_cancel_remain_on_channel( struct wiphy *wiphy,
     /* FIXME cancel currently running remain on chan.
      * Need to check cookie and cancel accordingly
      */
+    mutex_lock(&pHddCtx->roc_lock);
     if( (cfgState->remain_on_chan_ctx == NULL) ||
         (cfgState->remain_on_chan_ctx->cookie != cookie) )
     {
         hddLog( LOGE,
             "%s: No Remain on channel pending with specified cookie value",
              __func__);
+        mutex_unlock(&pHddCtx->roc_lock);
         return -EINVAL;
     }
     if (TRUE != pRemainChanCtx->is_pending_roc_cancelled)
     {
+       mutex_unlock(&pHddCtx->roc_lock);
        /* wait until remain on channel ready event received
         * for already issued remain on channel request */
        status = wait_for_completion_interruptible_timeout(&pAdapter->rem_on_chan_ready_event,
@@ -829,11 +834,13 @@ int __wlan_hdd_cfg80211_cancel_remain_on_channel( struct wiphy *wiphy,
            return 0;
 
        }
+        mutex_lock(&pHddCtx->roc_lock);
     }
     else
     {
         hddLog( LOG1, FL("Cancel ROC event is already pending, "
                          "waiting for ready on channel indication.") );
+        mutex_unlock(&pHddCtx->roc_lock);
         return 0;
     }
     if (NULL != cfgState->remain_on_chan_ctx)
@@ -841,6 +848,7 @@ int __wlan_hdd_cfg80211_cancel_remain_on_channel( struct wiphy *wiphy,
         vos_timer_stop(&cfgState->remain_on_chan_ctx->hdd_remain_on_chan_timer);
         if (TRUE == pRemainChanCtx->hdd_remain_on_chan_cancel_in_progress)
         {
+            mutex_unlock(&pHddCtx->roc_lock);
             hddLog( LOG1,
                     FL("ROC timer cancellation in progress,"
                        " wait for completion"));
@@ -858,6 +866,7 @@ int __wlan_hdd_cfg80211_cancel_remain_on_channel( struct wiphy *wiphy,
         else
             pRemainChanCtx->hdd_remain_on_chan_cancel_in_progress = TRUE;
     }
+    mutex_unlock(&pHddCtx->roc_lock);
     INIT_COMPLETION(pAdapter->cancel_rem_on_chan_var);
     /* Issue abort remain on chan request to sme.
      * The remain on channel callback will make sure the remain_on_chan
@@ -1109,7 +1118,7 @@ int __wlan_hdd_mgmt_tx( struct wiphy *wiphy, struct net_device *dev,
         rem_on_channel_request_type_t req_type = OFF_CHANNEL_ACTION_TX;
         // In case of P2P Client mode if we are already
         // on the same channel then send the frame directly
-
+        mutex_lock(&pHddCtx->roc_lock);
         if( (cfgState->remain_on_chan_ctx != NULL) &&
             (cfgState->current_freq == chan->center_freq)
           )
@@ -1149,6 +1158,7 @@ int __wlan_hdd_mgmt_tx( struct wiphy *wiphy, struct net_device *dev,
                 hddLog(VOS_TRACE_LEVEL_INFO,
                    "action frame: extending the wait time %u",
                    wait);
+                mutex_unlock(&pHddCtx->roc_lock);
                 goto send_frame;
             }
             else
@@ -1156,6 +1166,7 @@ int __wlan_hdd_mgmt_tx( struct wiphy *wiphy, struct net_device *dev,
                 if ( TRUE ==
                      pRemainChanCtx->hdd_remain_on_chan_cancel_in_progress )
                 {
+                    mutex_unlock(&pHddCtx->roc_lock);
                     hddLog(VOS_TRACE_LEVEL_INFO,
                            "action frame tx: waiting for completion of ROC ");
 
@@ -1168,12 +1179,14 @@ int __wlan_hdd_mgmt_tx( struct wiphy *wiphy, struct net_device *dev,
                                "%s:wait on cancel_rem_on_chan_var failed %d",
                                 __func__, status);
                     }
+                    goto bypass_lock;
                 }
             }
         }
+        mutex_unlock(&pHddCtx->roc_lock);
+bypass_lock:
         hddLog(VOS_TRACE_LEVEL_INFO,
                "action frame: Request ROC for wait time %u", wait);
-
         INIT_COMPLETION(pAdapter->offchannel_tx_event);
         status = wlan_hdd_request_remain_on_channel(wiphy, dev,
                                         chan,
@@ -1227,8 +1240,10 @@ int __wlan_hdd_mgmt_tx( struct wiphy *wiphy, struct net_device *dev,
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,38))
         if( cfgState->remain_on_chan_ctx )
         {
+            mutex_lock(&pHddCtx->roc_lock);
             cfgState->action_cookie = cfgState->remain_on_chan_ctx->cookie;
             *cookie = cfgState->action_cookie;
+            mutex_unlock(&pHddCtx->roc_lock);
         }
         else
         {
